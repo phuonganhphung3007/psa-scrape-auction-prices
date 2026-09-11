@@ -1,0 +1,153 @@
+import os
+import sys
+import time
+import math
+import pandas as pd
+from selenium import webdriver
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, StaleElementReferenceException, ElementClickInterceptedException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from bs4 import BeautifulSoup
+
+SCRAPE_URL = "https://www.psacard.com/auctionprices"
+EXAMPLE_URL = "https://www.psacard.com/auctionprices/baseball-cards/1967-topps/mets-rookies/values/187370"
+
+class PsaAuctionPricesScraper:
+    def __init__(self, card_url, card_name, driver):
+        self.card_url = card_url
+        self.card_name = card_name
+        self.driver = driver
+
+    def scrape(self):
+        print("collecting data for {}".format(self.card_name))
+        
+        # Navigate to webpage, pause until page finishes loading
+        driver.get(self.card_url)
+        page_loaded = self.pause_for_page_loading(self.driver)
+        if not page_loaded:
+            print("Error, page won't load for card {}".format(self.card_name))
+            return
+
+        # Get data from the current page/tables
+        df = self.get_data_from_page(driver)
+        
+        if df is None or df.empty:
+            print("No auction price records found for {}".format(self.card_name))
+            return
+
+        # Write to CSV file
+        if not os.path.exists("data"):
+            os.makedirs("data")
+        
+        df.to_csv(self.get_file_name(), index=False)
+        print("Successfully saved data to {}".format(self.get_file_name()))
+
+    def pause_for_page_loading(self, driver):
+        # Wait for potential client-side elements or spinners to settle
+        time.sleep(3)
+        tries = 10
+        while tries > 0:
+            try:
+                # If a spinner or loading mask is present, wait for it
+                spinner = driver.find_elements(By.ID, "spinner-wrap")
+                if spinner and spinner[0].is_displayed():
+                    time.sleep(1)
+                    tries -= 1
+                    continue
+                return True
+            except (NoSuchElementException, TimeoutException, StaleElementReferenceException):
+                return True
+            time.sleep(1)
+            tries -= 1
+        return True
+
+    def get_data_from_page(self, driver):
+        res = driver.page_source
+        soup = BeautifulSoup(res, "html5lib")
+        
+        # Look for tables or data grids containing auction records
+        tables = soup.find_all("table")
+        all_rows = []
+        headers = []
+
+        for table in tables:
+            trs = table.find_all("tr")
+            if not trs:
+                continue
+            
+            # Extract headers if available
+            ths = trs[0].find_all("th")
+            if ths:
+                headers = [th.get_text(strip=True).lower() for th in ths]
+            
+            # Check if this table looks like sales/auction history
+            table_text = table.get_text().lower()
+            if "price" in table_text or "date" in table_text or "auction" in table_text:
+                for tr in trs[1:]:
+                    tds = tr.find_all("td")
+                    if tds:
+                        row_data = [td.get_text(strip=True) for td in tds]
+                        all_rows.append(row_data)
+
+        if not all_rows:
+            # Fallback: parse generic container divs if tables aren't structured standardly
+            return pd.DataFrame()
+
+        # If headers count doesn't match row lengths, generate generic columns
+        if all_rows and len(headers) != len(all_rows[0]):
+            headers = ["col_{}".format(i) for i in range(len(all_rows[0]))]
+
+        df = pd.DataFrame(all_rows, columns=headers if headers else None)
+        return df
+
+    def get_file_name(self):
+        f_name = "{}--{}".format(self.card_name.replace(" ", "-"), str(time.strftime("%Y-%m-%d-%H%M%S")))
+        return "{}.csv".format(os.path.join("data", f_name))
+
+
+def init_driver():
+    driver = webdriver.Chrome()
+    driver.wait = WebDriverWait(driver, 5)
+    driver.maximize_window()
+    return driver
+
+
+if __name__ == '__main__':
+    # Input validation matching codebase style
+    try:
+        input_url = [sys.argv[1]]
+        if not input_url or not isinstance(input_url[0], str):
+            raise ValueError("input must be a url string with base '{}'".format(SCRAPE_URL))
+    except IndexError:
+        if not os.path.exists("urls.txt"):
+            raise ValueError("no input url passed and 'urls.txt' not found")
+        with open("urls.txt") as f:
+            urls_raw = [n for n in f.read().split("\n") if n]
+
+    urls = {}
+    for line in urls_raw:
+        elems = [n.strip() for n in line.split("|")]
+        if len(elems) == 2:
+            urls[elems[0]] = elems[1]
+        elif len(elems) == 1:
+            urls[elems[0]] = elems[0]
+        else:
+            raise ValueError("Malformed txt line:\n{}\nLines should be pipe-separated elements, like this:\n"\
+                             "1967 Topps Mets Rookies | https://www.psacard.com/auctionprices/baseball-cards/1967-topps/mets-rookies/values/187370")
+
+    if not os.path.exists("data"):
+        os.makedirs("data")
+
+    driver = None
+    try:
+        driver = init_driver()
+        for card_name, url in urls.items():
+            scraper = PsaAuctionPricesScraper(url, card_name, driver)
+            scraper.scrape()
+    except Exception as e:
+        print("An error occurred during execution: {}".format(e))
+        raise
+    finally:
+        if driver:
+            driver.quit()
