@@ -21,7 +21,7 @@ EXAMPLE_URL = "https://www.psacard.com/auctionprices/baseball-cards/1967-topps/m
 #   PowerShell:      $env:PSA_EMAIL="you@example.com"; $env:PSA_PASSWORD="yourpassword"
 #   macOS / Linux:   export PSA_EMAIL=you@example.com; export PSA_PASSWORD=yourpassword
 # If they are not set, the script will prompt you when it starts.
-LOGIN_URL = os.environ.get("PSA_LOGIN_URL", "https://www.psacard.com/login")
+LOGIN_URL = os.environ.get("PSA_LOGIN_URL", "https://app.collectors.com/signin?b=psa&r=https%253A%252F%252Fwww.psacard.com%252Fmyaccount%253FQTM_SID%253D12e2133a5ff942c1946dabe8e12acf2d%2526QTM_UID%253D6b45bfd1561e6d6d4b89f6fe2b98dd8a&QTM_SID=12e2133a5ff942c1946dabe8e12acf2d&QTM_UID=6b45bfd1561e6d6d4b89f6fe2b98dd8a")
 
 # Several candidate selectors per field, tried in order. If login fails, open
 # the page in Chrome, right-click the field -> Inspect, and put the real
