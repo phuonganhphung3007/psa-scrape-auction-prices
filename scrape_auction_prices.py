@@ -77,6 +77,25 @@ def find_visible_field(driver, selectors, timeout=15):
     raise TimeoutException("Could not find a visible field for selectors: {}".format(selectors))
 
 
+def find_visible_field_password(driver):
+    """Wait until any of the candidate selectors matches a visible element."""
+
+    # outer Descope component
+    descope_wc = driver.find_element(By.CSS_SELECTOR, "descope-wc")
+    shadow1 = descope_wc.shadow_root
+
+    # password component inside descope-wc's shadow root
+    password = shadow1.find_element(By.CSS_SELECTOR, "descope-password")
+    shadow2 = password.shadow_root
+
+    # input is directly reachable from this shadow root
+    password_input = shadow2.find_element(
+        By.CSS_SELECTOR,
+        'input[slot="input"][type="password"][autocomplete="current-password"]'
+    )
+    return password_input
+
+
 def login_finished(driver):
     """True once no password/code field is showing and we're off the login URL."""
     if driver.find_elements(By.CSS_SELECTOR, "input[type='password']"):
@@ -148,7 +167,7 @@ def login(driver, email, password):
     email_field.clear()
     email_field.send_keys(email)
     submit_step(driver, email_field)
-    time.sleep(2)
+    driver.implicitly_wait(2)  # wait for the next step to load
 
     # If the password prompt opened in a new window/tab, switch to it
     new_handles = set(driver.window_handles) - original_handles
@@ -156,7 +175,7 @@ def login(driver, email, password):
         driver.switch_to.window(new_handles.pop())
 
     # Step 2: password
-    password_field = find_visible_field(driver, PASSWORD_SELECTORS)
+    password_field = find_visible_field_password(driver)
     password_field.clear()
     password_field.send_keys(password)
     submit_step(driver, password_field)
