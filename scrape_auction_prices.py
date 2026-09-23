@@ -78,8 +78,6 @@ def find_visible_field(driver, selectors, timeout=15):
 
 
 def find_visible_field_password(driver):
-    """Wait until any of the candidate selectors matches a visible element."""
-
     # outer Descope component
     descope_wc = driver.find_element(By.CSS_SELECTOR, "descope-wc")
     shadow1 = descope_wc.shadow_root
