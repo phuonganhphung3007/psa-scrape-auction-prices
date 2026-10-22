@@ -12,9 +12,14 @@ and saves them into a SQLite table that holds only the links:
 
 How it works
 - Pages are opened directly by URL:  ...&page=1, &page=2, ...
-- Uses a persistent Chrome profile (./chrome_profile). The first run opens the
-  PSA sign-in page; you log in yourself (email -> password -> one-time code).
-  Later runs reuse that session, so you usually won't need to log in again.
+- Uses a persistent Chrome profile (./chrome_profile). If PSA shows the
+  sign-in page, the script logs in by itself: it types the email and password
+  (from PSA_EMAIL / PSA_PASSWORD, or asks you) and asks you in the terminal for
+  the one-time code PSA sends. If that gets stuck, finish it in the Chrome
+  window. Later runs reuse the session, so you usually won't log in again.
+- Behaves like a person: types with uneven pauses, moves the mouse to buttons
+  before clicking, scrolls through each results page in uneven steps (hovering
+  some links on the way), and takes a longer break every 15-30 pages.
 - Result links:   <a data-testid="link" href="/spec/psa/...">
 - Finds the end from the page itself: it stops after a page with no
   enabled next-arrow button (<svg data-testid="arrow-right-filled-icon">),
@@ -28,22 +33,32 @@ How it works
 - Stops cleanly (with the reason) if it's blocked: login not completed,
   session expired, captcha / bot challenge, access denied, rate limit.
 
+- Proxy (e.g. Thordata): --proxy http://user:pass@host:port, or set the
+  THORDATA_PROXY environment variable to that URL.
+
 Requirements:  pip install selenium
 (Selenium 4.6+ downloads the matching ChromeDriver automatically.)
 """
 
 import argparse
+import getpass
+import os
 import random
 import re
 import sqlite3
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urlencode, urljoin
+from urllib.parse import unquote, urlencode, urljoin, urlsplit
 
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import (ElementClickInterceptedException,
+                                        NoSuchElementException,
+                                        StaleElementReferenceException,
+                                        TimeoutException, WebDriverException)
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -57,6 +72,8 @@ PROFILE_DIR = str(Path("chrome_profile").resolve())
 LOGIN_TIMEOUT = 300          # seconds you have to finish logging in
 PAGE_TIMEOUT = 20            # seconds to wait for a results page
 DELAY_RANGE = (3.0, 6.0)     # polite pause between pages (seconds)
+BREAK_EVERY = (15, 30)       # take a longer break after this many pages...
+BREAK_RANGE = (30.0, 90.0)   # ...lasting this long (seconds)
 MAX_PAGES = 5000             # safety stop
 
 LINK_SELECTOR = 'a[data-testid="link"][href*="/spec/psa/"]'
@@ -81,6 +98,32 @@ CHALLENGE_MARKERS = (
     "attention required",
 )
 CHALLENGE_TIMEOUT = 180      # seconds you have to clear a human check
+
+# Login form fields (same flow as scrape_auction_prices.py). Several candidate
+# selectors per field, tried in order.
+EMAIL_SELECTORS = [
+    (By.CSS_SELECTOR, "input[type='email']"),
+    (By.CSS_SELECTOR, "input[name='email']"),
+    (By.CSS_SELECTOR, "input[name='username']"),
+    (By.ID, "email"),
+    (By.ID, "username"),
+]
+PASSWORD_SELECTORS = [
+    (By.CSS_SELECTOR, "input[type='password']"),
+    (By.CSS_SELECTOR, "input[name='password']"),
+    (By.ID, "password"),
+]
+# Field for the one-time code PSA sends after the password.
+CODE_SELECTORS = [
+    (By.CSS_SELECTOR, "input[autocomplete='one-time-code']"),
+    (By.CSS_SELECTOR, "input[name*='code' i]"),
+    (By.CSS_SELECTOR, "input[id*='code' i]"),
+    (By.CSS_SELECTOR, "input[name*='otp' i]"),
+    (By.CSS_SELECTOR, "input[inputmode='numeric']"),
+]
+_LOWER = "translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+SUBMIT_XPATH = ("//button[@type='submit' or " + " or ".join(
+    f"contains({_LOWER}, '{w}')" for w in ("continue", "next", "sign in", "log in")) + "]")
 
 
 class Blocked(Exception):
@@ -134,11 +177,97 @@ def write_progress(page: int) -> None:
 
 
 # ---------------- browser ----------------
-def make_driver() -> webdriver.Chrome:
+def make_driver(proxy: str | None = None) -> webdriver.Chrome:
+    """Start Chrome, optionally through a proxy.
+
+    proxy: http://host:port, or http://user:pass@host:port for proxies that
+    log in with a username/password (e.g. Thordata). Chrome ignores
+    credentials in --proxy-server, so they are answered through WebDriver
+    BiDi instead. SOCKS5 with a password is not supported by Chrome - use the
+    HTTP endpoint.
+    """
     opts = webdriver.ChromeOptions()
     opts.add_argument(f"--user-data-dir={PROFILE_DIR}")
     opts.add_argument("--window-size=1400,1000")
-    return webdriver.Chrome(options=opts)
+    user = password = None
+    if proxy:
+        parts = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+        user = unquote(parts.username) if parts.username else None
+        password = unquote(parts.password) if parts.password else ""
+        opts.add_argument(f"--proxy-server={parts.scheme}://{parts.hostname}:{parts.port}")
+        if user:
+            opts.enable_bidi = True
+    driver = webdriver.Chrome(options=opts)
+    if user:
+        driver.network.add_auth_handler(user, password)
+    return driver
+
+
+# ---------------- human-like behavior ----------------
+def human_pause(low: float = 0.4, high: float = 1.2) -> None:
+    time.sleep(random.uniform(low, high))
+
+
+def human_type(field, text: str) -> None:
+    """Type one character at a time with uneven gaps, like a person."""
+    field.clear()
+    for ch in text:
+        field.send_keys(ch)
+        time.sleep(random.uniform(0.05, 0.22))
+    human_pause(0.3, 0.8)
+
+
+def human_click(driver, element) -> None:
+    """Move the mouse onto the element, hesitate a moment, then click."""
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+    human_pause(0.2, 0.5)
+    try:
+        (ActionChains(driver)
+         .move_to_element_with_offset(element, random.randint(-3, 3), random.randint(-2, 2))
+         .pause(random.uniform(0.15, 0.45))
+         .click()
+         .perform())
+    except WebDriverException:
+        driver.execute_script("arguments[0].click();", element)
+
+
+def links_in_view(driver) -> list:
+    return driver.execute_script("""
+        return [...document.querySelectorAll(arguments[0])].filter(a => {
+            const r = a.getBoundingClientRect();
+            return r.width > 0 && r.top > 0 && r.bottom < window.innerHeight;
+        });""", LINK_SELECTOR)
+
+
+def browse_page(driver) -> None:
+    """Scroll down the page in uneven mouse-wheel steps, sometimes going back
+    up a little and hovering a result, ending near the bottom where the page
+    buttons are."""
+    for _ in range(40):                              # safety stop
+        at_bottom = driver.execute_script(
+            "return window.innerHeight + window.pageYOffset"
+            " >= document.body.scrollHeight - 5")
+        if at_bottom:
+            break
+        step = random.randint(250, 650)
+        if random.random() < 0.12:
+            step = -random.randint(100, 300)         # glance back up
+        try:
+            ActionChains(driver).scroll_by_amount(0, step).perform()
+        except WebDriverException:
+            driver.execute_script("window.scrollBy(0, arguments[0]);", step)
+        human_pause(0.4, 1.3)
+        if random.random() < 0.3:
+            try:
+                in_view = links_in_view(driver)
+                if in_view:
+                    (ActionChains(driver)
+                     .move_to_element(random.choice(in_view))
+                     .pause(random.uniform(0.3, 1.0))
+                     .perform())
+            except WebDriverException:
+                pass                                 # hovering is optional
+    human_pause(0.5, 1.5)
 
 
 def visible_text(driver) -> str:
@@ -186,25 +315,140 @@ def on_signin_page(driver) -> bool:
     return "/signin" in driver.current_url
 
 
+def get_credentials() -> tuple[str, str]:
+    email = os.environ.get("PSA_EMAIL") or input("PSA email: ").strip()
+    password = os.environ.get("PSA_PASSWORD") or getpass.getpass("PSA password: ")
+    return email, password
+
+
+def find_visible_field(driver, selectors, timeout: float = 15):
+    """Wait until any of the candidate selectors matches a visible element."""
+    end = time.time() + timeout
+    while True:
+        for by, value in selectors:
+            for el in driver.find_elements(by, value):
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        return el
+                except StaleElementReferenceException:
+                    continue
+        if time.time() >= end:
+            raise TimeoutException(f"no visible field for {selectors[0][1]!r}")
+        time.sleep(0.5)
+
+
+def login_finished(driver) -> bool:
+    """True once no password/code field is showing and we're off sign-in."""
+    for by, value in PASSWORD_SELECTORS[:1] + CODE_SELECTORS:
+        for el in driver.find_elements(by, value):
+            try:
+                if el.is_displayed():
+                    return False
+            except StaleElementReferenceException:
+                continue
+    return not on_signin_page(driver)
+
+
+def wait_for_code_field(driver, timeout: int = 15):
+    """Return the visible code input if PSA asks for one, else None."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            return find_visible_field(driver, CODE_SELECTORS, timeout=0)
+        except TimeoutException:
+            pass
+        if login_finished(driver):
+            return None
+        time.sleep(0.5)
+    return None
+
+
+def submit_step(driver, field) -> None:
+    """Click the visible submit / continue button, falling back to Enter."""
+    for btn in driver.find_elements(By.XPATH, SUBMIT_XPATH):
+        try:
+            if btn.is_displayed() and btn.is_enabled():
+                human_click(driver, btn)
+                return
+        except (ElementClickInterceptedException, StaleElementReferenceException):
+            continue
+    field.send_keys(Keys.ENTER)
+
+
+def dismiss_cookie_banner(driver) -> None:
+    """Best-effort close of a cookie/consent banner that could block clicks."""
+    for text in ("accept", "agree", "got it"):
+        for btn in driver.find_elements(By.XPATH, f"//button[contains({_LOWER}, '{text}')]"):
+            try:
+                if btn.is_displayed():
+                    human_click(driver, btn)
+                    human_pause()
+                    return
+            except WebDriverException:
+                continue
+
+
+def auto_login(driver) -> None:
+    """Email screen -> continue, password screen -> sign in, then the
+    one-time code (typed into the terminal)."""
+    human_pause(1.0, 2.0)
+    dismiss_cookie_banner(driver)
+    email, password = get_credentials()
+
+    handles = set(driver.window_handles)
+    field = find_visible_field(driver, EMAIL_SELECTORS)
+    human_type(field, email)
+    submit_step(driver, field)
+    human_pause(1.5, 3.0)
+    new = set(driver.window_handles) - handles       # password in a popup?
+    if new:
+        driver.switch_to.window(new.pop())
+
+    field = find_visible_field(driver, PASSWORD_SELECTORS)
+    human_type(field, password)
+    submit_step(driver, field)
+
+    code_field = wait_for_code_field(driver)
+    if code_field is not None:
+        code = (os.environ.get("PSA_AUTH_CODE")
+                or input("Enter the one-time code PSA just sent you: ").strip())
+        human_type(code_field, code)
+        submit_step(driver, code_field)
+
+    try:
+        WebDriverWait(driver, 20).until(login_finished)
+    except TimeoutException:
+        pass                                         # manual fallback handles it
+    if len(driver.window_handles) > 1:
+        driver.switch_to.window(driver.window_handles[0])
+
+
 def ensure_logged_in(driver, first_url: str) -> None:
     driver.get(first_url)
     time.sleep(2)
     if not on_signin_page(driver):
         return
 
-    print("\n[login] PSA redirected to the sign-in page.")
-    print("        Log in in the Chrome window (email -> password -> one-time code).")
-    print(f"        Waiting up to {LOGIN_TIMEOUT // 60} minutes...\n")
+    print("\n[login] PSA redirected to the sign-in page - logging in.")
+    try:
+        auto_login(driver)
+    except TimeoutException as e:
+        print(f"[login] Automatic login got stuck ({e}).")
 
-    deadline = time.time() + LOGIN_TIMEOUT
-    while time.time() < deadline:
-        time.sleep(3)
-        if not on_signin_page(driver):
-            break
-    else:
-        raise Blocked("Login declined / not completed: still on the sign-in "
-                      "page after the timeout. PSA requires a logged-in "
-                      "session to view search results.")
+    if on_signin_page(driver):
+        print("        Finish logging in in the Chrome window "
+              "(CAPTCHA, wrong password, a different code screen...).")
+        print(f"        Waiting up to {LOGIN_TIMEOUT // 60} minutes...\n")
+        deadline = time.time() + LOGIN_TIMEOUT
+        while time.time() < deadline:
+            time.sleep(3)
+            if not on_signin_page(driver):
+                break
+        else:
+            raise Blocked("Login declined / not completed: still on the sign-in "
+                          "page after the timeout. PSA requires a logged-in "
+                          "session to view search results.")
+    print("[login] Logged in.")
 
     driver.get(first_url)
     time.sleep(2)
@@ -294,8 +538,7 @@ def load_page(driver, page: int, prev_links) -> list[str]:
         if wait_for_links(driver, PAGE_TIMEOUT) and has_next_page(driver):
             svg = driver.find_elements(By.CSS_SELECTOR, NEXT_ARROW_SELECTOR)[-1]
             btn = svg.find_element(By.XPATH, "./ancestor::button[1]")
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-            driver.execute_script("arguments[0].click();", btn)
+            human_click(driver, btn)
             try:
                 WebDriverWait(driver, PAGE_TIMEOUT).until(
                     lambda d: page_links(d) and page_links(d) != prev_links)
@@ -310,10 +553,11 @@ def load_page(driver, page: int, prev_links) -> list[str]:
 
 
 # ---------------- main ----------------
-def crawl(start_page: int) -> None:
+def crawl(start_page: int, proxy: str | None = None) -> None:
     conn = open_db(DB_PATH)
-    driver = make_driver()
+    driver = make_driver(proxy)
     page, total_new, prev = start_page, 0, None
+    next_break = start_page + random.randint(*BREAK_EVERY)
     print(f"Starting at page {start_page}: {page_url(start_page)}")
     try:
         ensure_logged_in(driver, page_url(start_page))
@@ -327,6 +571,7 @@ def crawl(start_page: int) -> None:
                 print(f"[done] Page {page} says there are no results - reached the end.")
                 break
 
+            browse_page(driver)
             new = save_links(conn, links)
             total_new += new
             write_progress(page)
@@ -338,7 +583,13 @@ def crawl(start_page: int) -> None:
 
             prev = links
             page += 1
-            time.sleep(random.uniform(*DELAY_RANGE))
+            if page >= next_break:
+                pause = random.uniform(*BREAK_RANGE)
+                print(f"  taking a {pause:.0f}s break")
+                time.sleep(pause)
+                next_break = page + random.randint(*BREAK_EVERY)
+            else:
+                time.sleep(random.uniform(*DELAY_RANGE))
     except Blocked as e:
         print(f"\n[STOPPED] {e}")
         try:
@@ -362,6 +613,9 @@ if __name__ == "__main__":
     ap.add_argument("--page", type=int, help="start from this page number")
     ap.add_argument("--restart", action="store_true",
                     help="ignore progress.txt and start from page 1")
+    ap.add_argument("--proxy", default=os.environ.get("THORDATA_PROXY"),
+                    help="route Chrome through this proxy, e.g. "
+                    "http://user:pass@host:port (default: $THORDATA_PROXY)")
     args = ap.parse_args()
 
     if args.page:
@@ -370,4 +624,4 @@ if __name__ == "__main__":
         start = 1
     else:
         start = read_progress() + 1
-    crawl(start)
+    crawl(start, args.proxy)

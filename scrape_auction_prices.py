@@ -1,10 +1,13 @@
 import os
+import random
 import sys
 import time
 import getpass
+from urllib.parse import unquote, urlsplit
 import pandas as pd
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, StaleElementReferenceException, ElementClickInterceptedException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, StaleElementReferenceException, ElementClickInterceptedException, WebDriverException
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
@@ -54,6 +57,67 @@ SUBMIT_XPATH = (
     "contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in') or "
     "contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in')]"
 )
+
+
+DELAY_RANGE = (4.0, 9.0)  # pause between cards (seconds)
+
+
+# --- Human-like behavior --------------------------------------------------
+def human_pause(low=0.4, high=1.2):
+    time.sleep(random.uniform(low, high))
+
+
+def human_type(field, text):
+    """Type one character at a time with uneven gaps, like a person."""
+    field.clear()
+    for ch in text:
+        field.send_keys(ch)
+        time.sleep(random.uniform(0.05, 0.22))
+    human_pause(0.3, 0.8)
+
+
+def human_click(driver, element):
+    """Move the mouse onto the element, hesitate a moment, then click."""
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+    human_pause(0.2, 0.5)
+    try:
+        (ActionChains(driver)
+         .move_to_element_with_offset(element, random.randint(-3, 3), random.randint(-2, 2))
+         .pause(random.uniform(0.15, 0.45))
+         .click()
+         .perform())
+    except WebDriverException:
+        driver.execute_script("arguments[0].click();", element)
+
+
+def browse_page(driver):
+    """Scroll down the page in uneven mouse-wheel steps, sometimes going back
+    up a little and hovering a table row, like someone reading it."""
+    for _ in range(40):  # safety stop
+        at_bottom = driver.execute_script(
+            "return window.innerHeight + window.pageYOffset >= document.body.scrollHeight - 5")
+        if at_bottom:
+            break
+        step = random.randint(250, 650)
+        if random.random() < 0.12:
+            step = -random.randint(100, 300)  # glance back up
+        try:
+            ActionChains(driver).scroll_by_amount(0, step).perform()
+        except WebDriverException:
+            driver.execute_script("window.scrollBy(0, arguments[0]);", step)
+        human_pause(0.4, 1.3)
+        if random.random() < 0.3:
+            try:
+                rows = driver.execute_script("""
+                    return [...document.querySelectorAll('tr')].filter(r => {
+                        const b = r.getBoundingClientRect();
+                        return b.width > 0 && b.top > 0 && b.bottom < window.innerHeight;
+                    });""")
+                if rows:
+                    ActionChains(driver).move_to_element(random.choice(rows)).pause(random.uniform(0.3, 1.0)).perform()
+            except WebDriverException:
+                pass  # hovering is optional
+    human_pause(0.5, 1.5)
 
 
 def get_credentials():
@@ -113,7 +177,7 @@ def submit_step(driver, field):
     for btn in driver.find_elements(By.XPATH, SUBMIT_XPATH):
         try:
             if btn.is_displayed() and btn.is_enabled():
-                btn.click()
+                human_click(driver, btn)
                 return
         except (ElementClickInterceptedException, StaleElementReferenceException):
             continue
@@ -128,8 +192,8 @@ def dismiss_cookie_banner(driver):
         for btn in driver.find_elements(By.XPATH, xpath):
             try:
                 if btn.is_displayed():
-                    btn.click()
-                    time.sleep(0.5)
+                    human_click(driver, btn)
+                    human_pause()
                     return
             except Exception:
                 continue
@@ -145,10 +209,9 @@ def login(driver, email, password):
     # Step 1: email
     original_handles = set(driver.window_handles)
     email_field = find_visible_field(driver, EMAIL_SELECTORS)
-    email_field.clear()
-    email_field.send_keys(email)
+    human_type(email_field, email)
     submit_step(driver, email_field)
-    time.sleep(2)
+    human_pause(1.5, 3.0)
 
     # If the password prompt opened in a new window/tab, switch to it
     new_handles = set(driver.window_handles) - original_handles
@@ -157,8 +220,7 @@ def login(driver, email, password):
 
     # Step 2: password
     password_field = find_visible_field(driver, PASSWORD_SELECTORS)
-    password_field.clear()
-    password_field.send_keys(password)
+    human_type(password_field, password)
     submit_step(driver, password_field)
 
     # Step 3: authorization code (sent by PSA to your email/phone after the password)
@@ -166,8 +228,7 @@ def login(driver, email, password):
     if code_field is not None:
         # Codes are one-time, so ask for it each run. You can also pre-set PSA_AUTH_CODE.
         code = os.environ.get("PSA_AUTH_CODE") or input("Enter the authorization code PSA just sent you: ").strip()
-        code_field.clear()
-        code_field.send_keys(code)
+        human_type(code_field, code)
         submit_step(driver, code_field)
 
     # Wait until we've left the login flow
@@ -200,6 +261,9 @@ class PsaAuctionPricesScraper:
         if not page_loaded:
             print("Error, page won't load for card {}".format(self.card_name))
             return
+
+        # Scroll through the page like a person (also loads lazy content)
+        browse_page(self.driver)
 
         # Get data from the current page/tables
         df = self.get_data_from_page(self.driver)
@@ -279,7 +343,24 @@ class PsaAuctionPricesScraper:
 
 
 def init_driver():
-    driver = webdriver.Chrome()
+    # Optional proxy, e.g. Thordata residential:
+    #   THORDATA_PROXY=http://user:pass@host:port
+    # Chrome ignores credentials in --proxy-server, so they are answered
+    # through WebDriver BiDi instead (needs a recent selenium, e.g. 4.50).
+    options = webdriver.ChromeOptions()
+    proxy = os.environ.get("THORDATA_PROXY")
+    user = password = None
+    if proxy:
+        parts = urlsplit(proxy if "://" in proxy else "http://" + proxy)
+        user = unquote(parts.username) if parts.username else None
+        password = unquote(parts.password) if parts.password else ""
+        options.add_argument("--proxy-server={}://{}:{}".format(parts.scheme, parts.hostname, parts.port))
+        if user:
+            options.enable_bidi = True
+        print("Using proxy {}:{}".format(parts.hostname, parts.port))
+    driver = webdriver.Chrome(options=options)
+    if user:
+        driver.network.add_auth_handler(user, password)
     driver.wait = WebDriverWait(driver, 5)
     driver.maximize_window()
     return driver
@@ -316,7 +397,9 @@ if __name__ == '__main__':
     try:
         driver = init_driver()
         login(driver, email, password)
-        for card_name, url in urls.items():
+        for i, (card_name, url) in enumerate(urls.items()):
+            if i:
+                time.sleep(random.uniform(*DELAY_RANGE))
             scraper = PsaAuctionPricesScraper(url, card_name, driver)
             scraper.scrape()
     except Exception as e:
